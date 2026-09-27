@@ -1,0 +1,99 @@
+name: Terraform Plan
+
+on:
+    pull_request:
+        branches: [ main ]
+        paths: [ '.github/workflows/terraform-*.yml', 'infra/**' ]
+
+permissions:
+    contents: read
+    pull-requests: write
+    id-token: write
+
+concurrency:
+    group: terraform-plan-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    TF_VERSION: 1.16.0
+    AWS_REGION: eu-west-2
+
+jobs:
+    plan:
+        name: Terraform Plan
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                working-directory: infra
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v4
+              with:
+                 terraform_version: ${{ env.TF_VERSION }}
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                 role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+                 aws-region: ${{ env.AWS_REGION }}
+
+            - name: Format check
+              id: fmt
+              run: terraform fmt  -check -recursive
+              continue-on-error: true
+            - name: Init
+              run: terraform init -input=false
+
+            - name: Validate
+              run: terraform validate -no-color
+            - name: Plan
+              id: plan
+              run: |
+                terraform plan -no-color -input=false -out=tfplan
+                terraform show -no-color tfplan > plan.txt
+              continue-on-error: true
+
+            - name: comment the plan on the pull request
+              uses: actions/github-script@v7
+              env:
+                PLAN_STATUS: ${{ steps.plan.outcome }}
+                FMT_STATUS: ${{ steps.fmt.outcome }}
+              with:
+                script: |
+                    const fs = require('fs');
+
+                    let plan = fs.existsSync('infra/plan.txt')
+                    ? fs.readFileSync('infra/plan.txt', 'utf8')
+                    : 'Terraform plan output was not generated.';
+
+                    if (plan.length > 60000) {
+                    plan = plan.slice(0, 60000) + '\n\n...truncated, see the full job log.';
+                    }
+
+                    const body = [
+                    '### Terraform Plan',
+                    '',
+                    '| Check | Result |',
+                    '|---|---|',
+                    '| Format | ' + process.env.FMT_STATUS + ' |',
+                    '| Plan | ' + process.env.PLAN_STATUS + ' |',
+                    '',
+                    '<details><summary>Show plan</summary>',
+                    '',
+                    '```terraform',
+                    plan,
+                    '```',
+                    '',
+                    '</details>'
+                    ].join('\n');
+
+                    await github.rest.issues.createComment({
+                    issue_number: context.issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    body
+                    });
+            - name: fail if plan failed
+              if: steps.plan.outcome == 'failure'
+              run: exit 1
